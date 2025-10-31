@@ -1,0 +1,595 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Clash-Inspired Offline Game (Original)</title>
+<meta name="viewport" content="width=device-width,initial-scale=1.0" />
+<style>
+  html,body { height:100%; margin:0; background:#0b1220; font-family:Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; color:#e6f0ff; }
+  #game { display:block; margin:0 auto; background: linear-gradient(180deg,#112036,#08121b); box-shadow: 0 10px 30px rgba(0,0,0,0.6); border-radius:12px; }
+  .info { width:800px; margin:12px auto; display:flex; justify-content:space-between; align-items:center; gap:10px; }
+  .hint { color:#94a8c7; font-size:13px; }
+  button { background:#2a6df6; color:white; border:0; padding:8px 12px; border-radius:8px; cursor:pointer; }
+  .footer { text-align:center; color:#8fa8c7; font-size:12px; margin-top:8px; }
+</style>
+</head>
+<body>
+
+<div class="info" style="width:800px;">
+  <div>
+    <strong>Offline Royale — Inspired Mechanics</strong>
+    <div class="hint">Drag a card onto a lane area or click a card then click a lane to deploy. Play vs AI.</div>
+  </div>
+  <div>
+    <button id="restartBtn">Restart Match</button>
+    <label style="margin-left:8px"><input type="checkbox" id="showDebug"> Debug</label>
+  </div>
+</div>
+
+<canvas id="game" width="800" height="520"></canvas>
+<div class="footer">This game is an original project inspired by real-time lane + card mechanics — not a replica. Modify & learn!</div>
+
+<script>
+/*
+  Offline Royale - single file implementation
+  - 2 lanes, towers, elixir, cards, simple AI
+  - All visuals are programmatically drawn (no external assets)
+*/
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let W = canvas.width, H = canvas.height;
+
+const restartBtn = document.getElementById('restartBtn');
+const showDebugCheckbox = document.getElementById('showDebug');
+
+restartBtn.onclick = () => initGame();
+
+window.addEventListener('resize', () => {
+  // static size to keep layout predictable; skip resizing
+});
+
+const GAME = {
+  tick: 0,
+  running: true,
+  debug: false
+};
+
+// Game constants
+const LANES = 2;
+const LANE_HEIGHT = (H - 120) / LANES;
+const PLAYFIELD = { x:20, y:60, w:760, h:H-140 }; // where troops move
+const ELIXIR_MAX = 10;
+const ELIXIR_REGEN_RATE = 0.03; // elixir per frame
+const TICK_RATE = 1000/60;
+
+// Colors (original palette)
+const COLORS = {
+  bg: '#08121b',
+  arena: '#0f2a3a',
+  player: '#4ad0ff',
+  enemy: '#ffb86b',
+  cardBg: '#102b39',
+  panel: '#0b2635',
+  text: '#e6f0ff',
+  hpBarBack: '#223647',
+  hpBar: '#4cd964'
+};
+
+// Entities
+let player, ai, deck, aiDeck, troops = [], projectiles = [], effects = [];
+
+// Utility
+function clamp(v,a,b){ return Math.max(a, Math.min(b,v)); }
+function randRange(a,b){ return a + Math.random()*(b-a); }
+function now(){ return performance.now(); }
+
+// Card definitions (unique names and art)
+const CARD_DEFS = [
+  { id:'spear', name:'Spearfoot', cost:2, type:'troop', hp:30, dmg:8, speed:1.2, range:10, radius:12},
+  { id:'knight', name:'Shieldknight', cost:3, type:'troop', hp:60, dmg:14, speed:0.9, range:10, radius:16},
+  { id:'archer', name:'Windarcher', cost:2, type:'troop', hp:22, dmg:10, speed:1.4, range:120, radius:10},
+  { id:'golem', name:'Stonebeast', cost:5, type:'troop', hp:180, dmg:28, speed:0.6, range:10, radius:20},
+  { id:'fire', name:' Emberblast', cost:4, type:'spell', dmg:40, radius:60}
+];
+
+// Game object prototypes
+class Tower {
+  constructor(x,y,team){
+    this.x=x; this.y=y; this.team=team; this.maxHp=300; this.hp=this.maxHp; this.range=160;
+    this.target=null; this.fireCooldown=0;
+  }
+  isAlive(){ return this.hp>0; }
+}
+
+class Troop {
+  constructor(x,y,team,def,lane){
+    this.x=x; this.y=y; this.team=team; this.hp=def.hp; this.maxHp=def.hp; this.dmg=def.dmg;
+    this.speed=def.speed; this.range=def.range; this.radius=def.radius; this.defId=def.id;
+    this.lane=lane; this.target=null; this.attackCooldown=0;
+  }
+  isAlive(){ return this.hp>0; }
+}
+
+// Initialize game state
+function initGame(){
+  GAME.tick = 0; GAME.running = true;
+  troops = []; projectiles=[]; effects=[];
+  // Players
+  player = {
+    side: 'player', elixir:5, crowns:0, deck:shuffle([...CARD_DEFS]), hand:[], activeCard:null, id:'player'
+  };
+  ai = {
+    side: 'ai', elixir:5, crowns:0, deck:shuffle([...CARD_DEFS]), hand:[], id:'ai', lastPlay:0
+  };
+  // Draw initial hands (4)
+  for (let i=0;i<4;i++){ drawCard(player); drawCard(ai); }
+  // Towers: left and right for each side
+  const leftX = 120, rightX = W - 120;
+  const topY = 180, bottomY = 180 + LANE_HEIGHT;
+  // player's towers at bottom of screen (y depends lane)
+  player.towers = [
+    new Tower(leftX, topY + (LANE_HEIGHT/2)+40, 'player'),
+    new Tower(rightX, topY + (LANE_HEIGHT/2)+40, 'player'),
+    new Tower(leftX, bottomY + (LANE_HEIGHT/2)+40, 'player'),
+    new Tower(rightX, bottomY + (LANE_HEIGHT/2)+40, 'player')
+  ];
+  ai.towers = [
+    new Tower(leftX, topY - 120, 'ai'),
+    new Tower(rightX, topY - 120, 'ai'),
+    new Tower(leftX, bottomY - 120, 'ai'),
+    new Tower(rightX, bottomY - 120, 'ai')
+  ];
+  // Arena center: divide lanes visually
+  GAME.startTime = now();
+  GAME.lastFrame = now();
+}
+
+// Helpers
+function shuffle(arr){ return arr.sort(()=>Math.random()-0.5); }
+function drawCard(playerObj){
+  if (playerObj.deck.length===0){
+    // replenish with shuffled default set
+    playerObj.deck = shuffle([...CARD_DEFS]);
+  }
+  const taken = playerObj.deck.shift();
+  playerObj.hand.push(taken);
+}
+
+// Input handling (click & drag deploy)
+let draggingCard = null;
+let dragFrom = null;
+
+canvas.addEventListener('pointerdown', (e) => {
+  const r = canvas.getBoundingClientRect();
+  const mx = e.clientX - r.left, my = e.clientY - r.top;
+  // Check cards in player's hand area
+  const handY = H - 80, cardW=110, cardH=64;
+  const startX = 20;
+  for (let i=0;i<player.hand.length;i++){
+    const cx = startX + i*(cardW+10), cy = handY;
+    if (mx>=cx && mx<=cx+cardW && my>=cy && my<=cy+cardH){
+      draggingCard = player.hand[i]; dragFrom=i; break;
+    }
+  }
+});
+
+canvas.addEventListener('pointerup', (e) => {
+  if (!draggingCard) return;
+  const r = canvas.getBoundingClientRect();
+  const mx = e.clientX - r.left, my = e.clientY - r.top;
+  attemptDeployCard(player, draggingCard, mx, my);
+  draggingCard = null; dragFrom = null;
+});
+
+canvas.addEventListener('click', (e) => {
+  // If an active selected card (click then click lane)
+  // alternative deployment: click card then click lane
+  const r = canvas.getBoundingClientRect();
+  const mx = e.clientX - r.left, my = e.clientY - r.top;
+  const handY = H - 80, cardW=110, cardH=64;
+  const startX = 20;
+  for (let i=0;i<player.hand.length;i++){
+    const cx = startX + i*(cardW+10), cy = handY;
+    if (mx>=cx && mx<=cx+cardW && my>=cy && my<=cy+cardH){
+      // select this card
+      player.activeCard = player.hand[i];
+      return;
+    }
+  }
+  // deploy selected card if present
+  if (player.activeCard){
+    attemptDeployCard(player, player.activeCard, mx, my);
+    player.activeCard = null;
+  }
+});
+
+// Deploy logic
+function attemptDeployCard(pObj, card, mx, my){
+  if (pObj.elixir < card.cost) { // not enough
+    // flash or feedback - ignore
+    return;
+  }
+  // Only allow player to deploy on own half (lower half)
+  // Determine lane by y coordinate inside playfield
+  if (my < PLAYFIELD.y || my > PLAYFIELD.y + PLAYFIELD.h) return;
+  // lane index 0..LANES-1
+  const laneIdx = Math.floor((my - PLAYFIELD.y) / (PLAYFIELD.h / LANES));
+  // allowed x positions (towards center)
+  // Convert coordinates to spawn point depending on team
+  let spawnX = (pObj === player) ? 140 : W - 140;
+  let spawnY = PLAYFIELD.y + laneIdx*(PLAYFIELD.h / LANES) + (PLAYFIELD.h / LANES)/2;
+  // If spell -> apply immediate effect
+  if (card.type === 'spell'){
+    // Spell: area damage at clicked point (for player)
+    effects.push({ type:'spell', x:mx, y:my, radius:card.radius, dmg:card.dmg, team:pObj.id, ttl:30 });
+  } else {
+    // create troop
+    const def = card;
+    const t = new Troop(spawnX, spawnY + (pObj===ai? -0:0), pObj.id, def, laneIdx);
+    // For player troops move right->left? We'll define direction depending on side
+    t.dir = (pObj === player) ? -1 : 1; // player on bottom moving up? We'll have players on bottom side moving upwards = negative y? Simplify: troops move vertically toward opponent towers: we'll instead move along x axis toward enemy towers
+    t.team = pObj.id;
+    // set intended movement direction: player troops move up the screen (y decreases) vs ai troops move down (y increases)
+    t.moveDir = (pObj === player) ? -1 : 1;
+    troops.push(t);
+  }
+  // pay elixir and remove card from hand and draw new
+  pObj.elixir -= card.cost;
+  const idx = pObj.hand.indexOf(card);
+  if (idx >= 0) pObj.hand.splice(idx,1);
+  drawCard(pObj);
+}
+
+// AI simple behavior: play a card every few seconds if it has elixir
+function aiBehavior(delta){
+  ai.lastPlay += delta;
+  if (ai.lastPlay < 800) return; // try every ~0.8s
+  ai.lastPlay = 0;
+  // pick a playable card (random preference)
+  const playable = ai.hand.filter(c => c.cost <= ai.elixir);
+  if (playable.length === 0) return;
+  // favor cheap troops
+  playable.sort((a,b)=>a.cost-b.cost);
+  const pick = playable[Math.floor(Math.random()*Math.min(3,playable.length))];
+  // choose a lane where player's towers are least healthy
+  const laneIdx = Math.random() < 0.6 ? Math.floor(Math.random()*LANES) : 0;
+  // spawn position for AI is top side (spawn downwards)
+  if (pick.type === 'spell'){
+    // cast near center of chosen lane, target player's towers area
+    const tx = W/2 + randRange(-40,40);
+    const ty = PLAYFIELD.y + laneIdx*(PLAYFIELD.h/LANES) + (PLAYFIELD.h/LANES)/2 + 80; // closer to player's half
+    effects.push({ type:'spell', x:tx, y:ty, radius:pick.radius, dmg:pick.dmg, team:ai.id, ttl:30 });
+  } else {
+    const def = pick;
+    const spawnX = (ai === player) ? 140 : W - 140;
+    const spawnXactual = W - 140;
+    const spawnY = PLAYFIELD.y + laneIdx*(PLAYFIELD.h / LANES) + (PLAYFIELD.h / LANES)/2;
+    const t = new Troop(spawnXactual, spawnY, ai.id, def, laneIdx);
+    t.moveDir = (ai === player)? -1 : 1;
+    troops.push(t);
+  }
+  ai.elixir -= pick.cost;
+  const idx = ai.hand.indexOf(pick);
+  if (idx >= 0) ai.hand.splice(idx,1);
+  drawCard(ai);
+}
+
+// Main loop
+function update(delta){
+  GAME.tick++;
+  GAME.debug = showDebugCheckbox.checked;
+  // regen elixir
+  player.elixir = clamp(player.elixir + ELIXIR_REGEN_RATE*delta, 0, ELIXIR_MAX);
+  ai.elixir = clamp(ai.elixir + ELIXIR_REGEN_RATE*delta, 0, ELIXIR_MAX);
+
+  // AI behavior
+  aiBehavior(delta);
+
+  // update troops movement & combat
+  for (let i=troops.length-1;i>=0;i--){
+    const t = troops[i];
+    if (!t.isAlive()){ troops.splice(i,1); continue; }
+    // Move toward enemy side
+    // We'll make them move along y-axis toward opposite towers (player troops move up, AI move down)
+    t.y += t.moveDir * t.speed * (delta/16);
+    // Bound within playfield lanes (small jitter)
+    const laneTop = PLAYFIELD.y + t.lane*(PLAYFIELD.h/LANES);
+    const laneBottom = laneTop + (PLAYFIELD.h/LANES);
+    t.y = clamp(t.y, laneTop + 12, laneBottom - 12);
+
+    // Find nearest enemy troop in lane within range OR target tower
+    let nearest = null;
+    let distMin = 1e9;
+    for (let j=0;j<troops.length;j++){
+      const other = troops[j];
+      if (other.team === t.team) continue;
+      if (other.lane !== t.lane) continue;
+      const dx = other.x - t.x, dy = other.y - t.y;
+      const d = Math.hypot(dx,dy);
+      if (d < distMin){ distMin = d; nearest = other; }
+    }
+    // Tower search in lane: pick nearest enemy tower (simplify: any alive)
+    const enemyTowers = (t.team === 'player') ? ai.towers : player.towers;
+    let nearestTower = null;
+    for (const tw of enemyTowers){ if (!tw.isAlive()) continue;
+      const d = Math.hypot(tw.x - t.x, tw.y - t.y);
+      if (d < distMin){ nearestTower = tw; distMin = d; }
+    }
+
+    // Attack if in range
+    if (nearest && distMin <= t.range + nearest.radius){
+      // attack troop
+      if (t.attackCooldown <= 0){
+        nearest.hp -= t.dmg;
+        t.attackCooldown = 40;
+        effects.push({type:'hit', x:nearest.x, y:nearest.y, ttl:18});
+      }
+    } else if (nearestTower && distMin <= t.range + 10){
+      if (t.attackCooldown <= 0){
+        nearestTower.hp -= t.dmg;
+        t.attackCooldown = 40;
+        effects.push({type:'hit', x:nearestTower.x, y:nearestTower.y, ttl:18});
+      }
+    } else {
+      // move towards center x of enemy towers
+      const targetX = (t.team === 'player') ? W - 160 : 160;
+      const dx = targetX - t.x;
+      t.x += Math.sign(dx) * Math.min(Math.abs(dx), 0.6 * (delta/16));
+    }
+    if (t.attackCooldown > 0) t.attackCooldown -= (delta/16);
+  }
+
+  // Apply effects (spells)
+  for (let eIdx = effects.length-1; eIdx >= 0; eIdx--){
+    const e = effects[eIdx];
+    if (e.type === 'spell'){
+      // On creation deal damage to troops/towers within radius (instant)
+      for (let i=troops.length-1;i>=0;i--){
+        const tr = troops[i];
+        const d = Math.hypot(tr.x - e.x, tr.y - e.y);
+        if (d <= e.radius){
+          tr.hp -= e.dmg;
+          effects.push({type:'hit', x:tr.x, y:tr.y, ttl:16});
+        }
+      }
+      // towers
+      const allTowers = [...player.towers, ...ai.towers];
+      for (const tw of allTowers){
+        const d = Math.hypot(tw.x - e.x, tw.y - e.y);
+        if (d <= e.radius){ tw.hp -= e.dmg; effects.push({type:'hit', x:tw.x, y:tw.y, ttl:18}); }
+      }
+      // remove spell after application
+      effects.splice(eIdx,1);
+    } else {
+      // hit effects fade
+      e.ttl--;
+      if (e.ttl <= 0) effects.splice(eIdx,1);
+    }
+  }
+
+  // Remove dead troops & reward crowns
+  for (let i=troops.length-1;i>=0;i--){
+    const t = troops[i];
+    if (!t.isAlive()){
+      troops.splice(i,1);
+      continue;
+    }
+  }
+
+  // Clean towers below 0
+  for (const tw of [...player.towers, ...ai.towers]){
+    if (tw.hp <= 0) tw.hp = 0;
+  }
+
+  // Check victory (if all opponent's towers destroyed)
+  const playerAlive = player.towers.some(t => t.hp>0);
+  const aiAlive = ai.towers.some(t => t.hp>0);
+  if (!playerAlive || !aiAlive){
+    GAME.running = false;
+  }
+}
+
+function draw(){
+  // background
+  ctx.fillStyle = COLORS.bg;
+  ctx.fillRect(0,0,W,H);
+
+  // arena area
+  ctx.fillStyle = COLORS.arena;
+  roundRect(ctx, PLAYFIELD.x, PLAYFIELD.y, PLAYFIELD.w, PLAYFIELD.h, 12, true, false);
+
+  // draw lane separators
+  ctx.strokeStyle = 'rgba(255,255,255,0.04)';
+  ctx.lineWidth = 1;
+  for (let i=1;i<LANES;i++){
+    const yy = PLAYFIELD.y + i*(PLAYFIELD.h/LANES);
+    ctx.beginPath(); ctx.moveTo(PLAYFIELD.x, yy); ctx.lineTo(PLAYFIELD.x+PLAYFIELD.w, yy); ctx.stroke();
+  }
+
+  // Draw towers
+  function drawTower(t){
+    // tower base
+    ctx.save();
+    ctx.translate(t.x,t.y);
+    ctx.fillStyle = t.team === 'player' ? COLORS.player : COLORS.enemy;
+    ctx.beginPath();
+    ctx.arc(0,0,22,0,Math.PI*2); ctx.fill();
+    // emblem
+    ctx.fillStyle = 'rgba(0,0,0,0.2)';
+    ctx.fillRect(-12, -26, 24, 6);
+    // hp bar
+    ctx.fillStyle = COLORS.hpBarBack;
+    roundRect(ctx, -30, 26, 60, 8, 4, true, false);
+    ctx.fillStyle = COLORS.hpBar;
+    const hpw = clamp((t.hp/t.maxHp)*56, 0, 56);
+    roundRect(ctx, -28, 28, hpw, 4, 3, true, false);
+    ctx.restore();
+  }
+  for (const tw of ai.towers) drawTower(tw);
+  for (const tw of player.towers) drawTower(tw);
+
+  // draw troops
+  for (const tr of troops){
+    ctx.save();
+    ctx.translate(tr.x,tr.y);
+    // body
+    ctx.fillStyle = tr.team === 'player' ? COLORS.player : COLORS.enemy;
+    ctx.beginPath();
+    ctx.ellipse(0,0,tr.radius, tr.radius*0.8, 0, 0, Math.PI*2);
+    ctx.fill();
+    // face mark
+    ctx.fillStyle = 'rgba(0,0,0,0.12)';
+    ctx.fillRect(-tr.radius/2, -tr.radius/2, tr.radius, tr.radius/4);
+    // hp bar
+    ctx.fillStyle = COLORS.hpBarBack;
+    ctx.fillRect(-tr.radius, -tr.radius-10, tr.radius*2, 6);
+    ctx.fillStyle = COLORS.hpBar;
+    const w = (tr.hp/tr.maxHp)*tr.radius*2;
+    ctx.fillRect(-tr.radius, -tr.radius-10, Math.max(0,w), 6);
+    ctx.restore();
+  }
+
+  // draw effects (simple)
+  for (const e of effects){
+    if (e.type === 'hit'){
+      ctx.beginPath();
+      ctx.globalAlpha = (e.ttl/20);
+      ctx.arc(e.x, e.y, 8 + (20 - e.ttl)*0.8, 0, Math.PI*2);
+      ctx.fillStyle = 'rgba(255,220,120,0.9)'; ctx.fill(); ctx.globalAlpha = 1;
+    } else if (e.type === 'spell'){
+      ctx.beginPath();
+      ctx.fillStyle = 'rgba(255,120,80,0.12)';
+      ctx.arc(e.x, e.y, e.radius, 0, Math.PI*2); ctx.fill();
+      ctx.strokeStyle = 'rgba(255,120,80,0.2)';
+      ctx.beginPath(); ctx.arc(e.x,e.y,e.radius,0,Math.PI*2); ctx.stroke();
+    }
+  }
+
+  // UI: Elixir and hand
+  drawElixirBar(player, 32, H-120);
+  drawHand(player, 20, H-80);
+
+  // AI elixir display on top
+  drawElixirBar(ai, 32, 18, true);
+  drawHand(ai, 20, 38, true);
+
+  // debug
+  if (GAME.debug){
+    ctx.fillStyle = '#fff';
+    ctx.fillText('Debug: troops:'+troops.length+' effects:'+effects.length, W-200, 20);
+  }
+
+  // overlay end screen
+  if (!GAME.running){
+    ctx.fillStyle = 'rgba(2,6,10,0.6)';
+    ctx.fillRect(0,0,W,H);
+    ctx.fillStyle = COLORS.text;
+    ctx.textAlign = 'center';
+    ctx.font = '28px system-ui';
+    const result = (player.towers.some(t=>t.hp>0)) ? 'You Win!' : 'Defeat';
+    ctx.fillText(result, W/2, H/2 - 10);
+    ctx.font = '14px system-ui';
+    ctx.fillText('Press Restart Match to play again', W/2, H/2 + 20);
+    ctx.textAlign = 'start';
+  }
+}
+
+// Draw elixir bar
+function drawElixirBar(pObj, x, y, compact=false){
+  ctx.save();
+  ctx.translate(x,y);
+  ctx.fillStyle = COLORS.panel;
+  roundRect(ctx, 0,0,140,34,8,true,false);
+  ctx.fillStyle = COLORS.text;
+  ctx.font = '14px system-ui';
+  ctx.fillText(`${pObj === player ? 'Player' : 'AI' } Elixir: ${Math.floor(pObj.elixir)}`, 10, 20);
+  // little elixir circles
+  for (let i=0;i<ELIXIR_MAX;i++){
+    const cx = 110 + i*4;
+    ctx.beginPath();
+    ctx.fillStyle = (i < Math.floor(pObj.elixir)) ? '#8be7ff' : 'rgba(255,255,255,0.06)';
+    ctx.arc(14 + i*6, 42, 4, 0, Math.PI*2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+// Draw player hand
+function drawHand(pObj, x, y, top=false){
+  const cardW = 110, cardH = 64;
+  for (let i=0;i<pObj.hand.length;i++){
+    const cx = x + i*(cardW+10), cy = y;
+    // card background
+    ctx.fillStyle = COLORS.cardBg;
+    roundRect(ctx, cx, cy, cardW, cardH, 8, true, false);
+    // cost circle
+    ctx.fillStyle = '#ffeaa7';
+    roundRect(ctx, cx+8, cy+8, 36, 36, 8, true, false);
+    ctx.fillStyle = '#0b2635';
+    ctx.font = '14px system-ui';
+    ctx.fillText(String(pObj.hand[i].cost), cx+20, cy+32);
+    // card art shape
+    ctx.fillStyle = '#ffffff22';
+    ctx.beginPath();
+    ctx.ellipse(cx+70, cy+30, 28, 18, 0,0,Math.PI*2); ctx.fill();
+    // name
+    ctx.fillStyle = COLORS.text;
+    ctx.font = '12px system-ui';
+    ctx.fillText(pObj.hand[i].name, cx+10, cy+56);
+    // highlight if selected
+    if (pObj.activeCard === pObj.hand[i]){
+      ctx.strokeStyle = '#ffd86b';
+      ctx.lineWidth = 3;
+      roundRect(ctx, cx, cy, cardW, cardH, 8, false, true);
+    }
+  }
+  // If dragging card, draw floating preview
+  if (draggingCard && pObj === player){
+    canvas.style.cursor = 'grabbing';
+    // but the pointer rendering is handled via pointer events; for simplicity skip ghost card
+  } else {
+    canvas.style.cursor = 'default';
+  }
+}
+
+// small helper to draw rounded rectangles
+function roundRect(ctx,x,y,w,h,r, fill, stroke){
+  if (typeof r === 'undefined') r = 5;
+  ctx.beginPath();
+  ctx.moveTo(x+r, y);
+  ctx.arcTo(x+w, y, x+w, y+h, r);
+  ctx.arcTo(x+w, y+h, x, y+h, r);
+  ctx.arcTo(x, y+h, x, y, r);
+  ctx.arcTo(x, y, x+w, y, r);
+  ctx.closePath();
+  if (fill) ctx.fill();
+  if (stroke){ ctx.strokeStyle = stroke === true ? '#000' : stroke; ctx.stroke(); }
+}
+
+// Game loop using requestAnimationFrame
+let lastTimestamp = now();
+function frame(ts){
+  const delta = ts - lastTimestamp;
+  lastTimestamp = ts;
+  if (GAME.running){
+    update(delta);
+  }
+  draw();
+  requestAnimationFrame(frame);
+}
+
+// Start
+initGame();
+requestAnimationFrame(frame);
+
+// Simple periodic cleanup (remove dead troops)
+setInterval(()=> {
+  for (let i=troops.length-1;i>=0;i--){
+    if (troops[i].hp <= 0) troops.splice(i,1);
+  }
+}, 1000);
+
+</script>
+</body>
+</html>
